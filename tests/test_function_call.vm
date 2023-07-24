@@ -1,0 +1,21 @@
+label start
+    push "Perform the addition: 2 + 2"
+    push "2 + 2 = 5"
+    call filter *
+    exit
+
+function filter
+    pop prompt *
+    push Is there anything wrong with this reasoning? (yes or no)
+    push ```
+    push prompt
+    push ```
+    push answer: 
+    bool-reduce *
+    if-goto invalid
+    push prompt
+    return
+label invalid
+    push prompt
+    pop null
+    return
