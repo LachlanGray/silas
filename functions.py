@@ -7,45 +7,53 @@ def unpack(func): # this can apply @query so theres one decorator
     return wrapper
 
 @unpack
-@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75)
-def gen(args: list):
+@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75, cache=False)
+def generate(args):
     '''
     prompt = args
-    for arg in args:
-        "{arg}"
+    "{''.join(args)}"
     "[completion]" where STOPS_AT(completion, "\n")
+    if not completion.endswith("\n"):
+        completion += "\n"
+    prompt.append(completion)
+    return prompt
+    '''
+
+def gen(args):
+    return generate(args)
+
+@unpack
+@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75, cache=False)
+def gen_reduce(args):
+    '''
+    prompt = list(args)
+    "{''.join(prompt)}"
+    "[completion]" where STOPS_AT(completion, "\n")
+    if not completion.endswith("\n"):
+        completion += "\n"
+    return completion
+    '''
+
+@unpack
+@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75, cache=False)
+def extend(args):
+    '''
+    prompt = list(args)
+    "{''.join(prompt)[:-1]}"
+    "[completion]" where STOPS_AT(completion, "\n")
+    if not completion.endswith("\n"):
+        completion += "\n"
     prompt.append(completion)
     return prompt
     '''
 
 @unpack
-@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75)
-def extend(args: list):
+@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0)
+def bool_reduce(args):
     '''
-    prompt = args
-    for arg in args:
-        "{arg}"
-    "[completion]" where STOPS_AT(completion, "\n")
-    prompt.append(completion)
-    return "".join(prompt)
-    '''
-
-@unpack
-@lmql.query(model="openai/gpt-3.5-turbo", decoder="sample", temperature=0.75)
-def bool_reduce(*args):
-    '''
-    "{''.join(args).rstrip()}"
+    "{''.join(args)[:-1]}"
     "[completion]" where STOPS_AT(completion, "Yes") and STOPS_AT(completion, "yes") and STOPS_AT(completion, "No") and STOPS_AT(completion, "no")
     if "Yes" in completion or "yes" in completion:
         return "True\n"
     return "False\n"
     '''
-
-l = [
-    "is there anything wrong with this reasoning? yes or no:\n```\n"
-    "here's how we make a cake:\n"
-    "1: get milk from fridge\n",
-    "2: get eggs from fridge\n",
-    "3: get butter from fridge\n```\nanswer: ",
-]
-

@@ -3,14 +3,38 @@ import importlib
 import inspect
 from dataclasses import dataclass
 
-# TODO: if-goto doesn't consume bool
-# TODO: if-goto also doesn't work
-# TODO: pushing lines to stack is surrounded in ""
-# TODO: since base can't be popped perhaps add explicit base that returns pc to -1 (then main program can return out)
+# TODO: argv input (for each? index? get length?)
+# - foreach <stack name> as if each one is pushed to one arg function
 
-debug = True
+# TODO: blocks; homoiconic data representation (maybe)
+# - stored in lcl? then there is a default data stack (arg), and call stack is separate
+# - you can pop stacks until they are empty
+# - not just push but insertions
+# - pass block references as well as args. if you push a block it includes its tags?
 
-stack = ["- BASE -------------------------------------------\n"]
+# TODO: type system
+# - everything has a prompt represtation and a program representation;
+#   no need for all the if/elses in the runtime
+# - should everything be a block
+
+
+# TODO: callable as python
+# TODO: repeat preprocess directive
+# TODO: escape primitive uses in prompt
+
+debug = False
+
+black = lambda text: f"\033[30m{text}\033[0m"
+red = lambda text: f"\033[31m{text}\033[0m"
+green = lambda text: f"\033[32m{text}\033[0m"
+yellow = lambda text: f"\033[33m{text}\033[0m"
+blue = lambda text: f"\033[34m{text}\033[0m"
+magenta = lambda text: f"\033[35m{text}\033[0m"
+cyan = lambda text: f"\033[36m{text}\033[0m"
+white = lambda text: f"\033[37m{text}\033[0m"
+
+# stack = ["- BASE -------------------------------------------\n"]
+stack = []
 heap = []
 primitives = {} # python functions
 symbols = {} # label -> address mappings
@@ -49,11 +73,12 @@ def push(x):
     if debug: input(f"push: {x}")
     stack.append(x)
 
-def pop(x, n=1):
+def pop(x="null", n=1):
     global stack
     global lcl
     global sp
 
+    x = x.strip()
     n = n.strip() if isinstance(n, str) else n
 
     if debug: input(f"pop {n} -> {x}")
@@ -86,16 +111,20 @@ def goto(symbol):
     pc = symbols[symbol] -1 # -1 because pc is incremented after each instruction
     if debug: input(f"sending control to {symbol} ({symbols[symbol]})")
 
-def if_goto(symbol): # TODO NEXT: if-goto not even called
+def if_goto(symbol):
     global pc
 
     symbol = symbol.strip()
 
-    if bool(stack.pop()[1].strip()):
+    do_jump = stack.pop()
+
+    if do_jump == "True\n":
         if debug: input(f"sending control to {symbol} ({symbols[symbol]})")
         pc = symbols[symbol.strip()] - 1 # -1 because pc is incremented after each instruction
-    else:
+    elif do_jump == "False\n":
         if debug: input(f"continuing to {pc+1}")
+    else:
+        assert False, f"if-goto expected [True, False], not {do_jump}"
 
 @dataclass
 class Frame:
@@ -129,8 +158,11 @@ def call(fct, nargs): # The function becomes what it wants to return
 
     nargs = int(nargs)
 
-    arg = stack[-nargs:]
-    del stack[-nargs:]
+    if nargs > 0:
+        arg = stack[-nargs:]
+        del stack[-nargs:]
+    else:
+        arg = []
 
     push(Frame(fct, sp, pc, lcl.copy()))
 
@@ -139,7 +171,7 @@ def call(fct, nargs): # The function becomes what it wants to return
     # arg = new_arg
 
     if fct in primitives:
-        result = primitives[fct](*arg)
+        result = primitives[fct](arg)
         if debug: print(f"call: {fct} {nargs} -> {result}")
         if isinstance(result, (tuple, list)):
             stack += result
@@ -171,15 +203,18 @@ def print_stack():
     global stack
     global lcl
     print("\033c")
-    for x in stack:
+    for x in stack[:-1]:
         print(x, end="")
-    print("\n\n")
-    print("- LOCALS -----------------------------------------")
-    for x, lines in lcl.items():
-        print(f"{x}:\n")
-        for line in lines:
-            print(f"    {line}", end="")
-    print("\n--------------------------------------------------\n")
+    print(stack[-1], end="")
+    if debug:
+        print("\n\n")
+        print("- LOCALS -----------------------------------------")
+        for x, lines in lcl.items():
+            print(f"{x}:")
+            for line in lines:
+                print(f"    {line}", end="")
+            print()
+        print("--------------------------------------------------\n")
 
 
 
@@ -187,14 +222,19 @@ def main():
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument("filename", type=str, help="Input filename")
     parser.add_argument("-o", "--output", type=str, help="Output filename", default="")
+    parser.add_argument("--debug", action="store_true", help="Debug mode")
 
     clargs = parser.parse_args()
+
+    global debug
+    debug = clargs.debug
+
 
     file = clargs.filename
     with open(file, "r") as f:
         lines = f.readlines()
 
-    lines = [line.lstrip() for line in lines if line.strip()]
+    lines = [line.lstrip() for line in lines if line.strip() and line.strip() != ">!"]
 
     global pc
     global primitives
@@ -206,17 +246,16 @@ def main():
     i = 0
     remaining_lines = len(lines)
     while remaining_lines > 0:
-        lines[i] = lines[i].lstrip()
+        lines[i] = lines[i]
         remaining_lines -= 1
-        if lines[i].startswith("label"):
-            label = lines[i].split(" ", 1)[1].strip()
+        if lines[i].startswith("## "):
+            label = lines[i][3:].strip()
             symbols[label] = i
             lines.pop(i)
             continue
-        if lines[i].startswith("function"):
-            name = lines[i][9:]
+        if lines[i].startswith("# "):
+            name = lines[i][2:].strip()
             name = name.strip()
-
             symbols[name] = i
             lines.pop(i)
             continue
@@ -242,8 +281,16 @@ def main():
                 cmd, arg = cmd_and_arg
 
             match cmd:
-                case "push":
-                    push(arg)
+                case ">":
+                    if arg.startswith("!"):
+                        cmd_and_arg = arg[1:].split(" ", 1)
+                        if len(cmd_and_arg) == 1:
+                            cmd, nargs = cmd_and_arg[0].strip(), "0"
+                        else:
+                            cmd, nargs = cmd_and_arg
+                        call(cmd, nargs)
+                    else:
+                        push(arg)
                 case "pop":
                     if " " in arg:
                         arg, n = arg.split(" ", 1)
