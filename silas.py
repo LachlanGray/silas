@@ -153,18 +153,7 @@ class Float:
 #     def __str__(self):
 #         return str(self.value) + "\n"
 
-# RUNTIME ########################################;
-
-call_stack = []
-heap = []
-primitives = {} # python functions
-symbols = {} # label -> address mappings
-static = {}
-
-pc = 0
-block = "arg"
-lcl = {"arg": Block()}
-block_stack = []
+# TYPES ########################################;
 
 @dataclass
 class Frame:
@@ -193,6 +182,8 @@ class ForFrame:
         return green(r + (50-len(r)) * "-")
 
 
+# OPERATIONS #####################################;
+# utils ####################
 def parse_arg(x: str):
     # transform string into typed prompt object
     x_stripped = x.strip()
@@ -209,7 +200,7 @@ def parse_arg(x: str):
 
     return value
 
-def separate_string(s):
+def dissect_prompt(s):
     result = []
     last_end = 0
     for match in re.finditer(r'(?<!\\)(\[.*?\])|(?<!\\)({.*?})', s):
@@ -227,12 +218,7 @@ def separate_string(s):
         result.append((s[last_end:].replace("\\[", "[").replace("\\]", "]").replace("\\{", "{").replace("\\}", "}"), "prompt"))
     return result
 
-
-# OPERATIONS #####################################;
-
 def get_completion(input_string, stop=[]):
-
-    # Assign stopping tokens if provided
 
     if not stop:
         stop = ["\n"]
@@ -246,6 +232,8 @@ def get_completion(input_string, stop=[]):
     )
 
     return response['choices'][0]['message']['content']
+
+# primitives ################
 
 def push(x):
     global lcl
@@ -263,7 +251,7 @@ def push(x):
 def fill_prompt(prompt):
     global lcl
 
-    segments = separate_string(prompt)
+    segments = dissect_prompt(prompt)
     context = [str(lcl[block])]
     filled = []
     for segment, segment_type in segments:
@@ -550,53 +538,19 @@ def close_for_loop():
     # close_block(call_stack[-1].for_block_name)
     pc = call_stack[-1].open_pc
 
-# INTERFACE ########################################;
 
-def print_stack():
-    if len(call_stack) == 0:
-        return
+# SILAS ########################################
 
-    print("\033c")
-    print(blue(f"= TRACE =========================================="))
+call_stack = []
+heap = []
+primitives = {} # python functions
+symbols = {} # label -> line number mappings
+static = {}
 
-    prev_frame = call_stack[0]
-    for frame in call_stack[1:]:
-        print(prev_frame)
-        # print(frame.lcl)
-        if not isinstance(frame, ForFrame):
-            for line in frame.lcl[frame.block].lines:
-                print(line)
-
-        prev_frame = frame
-    print(prev_frame)
-    print()
-
-    print(lcl[block])
-    if isinstance(call_stack[-1], ForFrame):
-        print(green("--------------------------------------------------"))
-
-    l = len(block) + 4
-    rem = 50 - l
-    s = "-"*(int(rem/2)) + f" [{block}] "
-    s = s + "-"*(50-len(s))
-    print(cyan(s))
-    print()
-    # print(str(lcl))
-
-
-    print(blue(f"= LOCALS ========================================="))
-    for var, val in lcl.items():
-        if var == block:
-            continue
-
-        val_type = str(type(val)).split("'")[1].split(".")[1]
-        s = f"- {var} ({val_type}) "
-        s = s + "-"*(50-len(s))
-        print(cyan(s))
-        if val:
-            print()
-            print(val, end="")
-            print()
+pc = 0
+block = "arg"
+lcl = {"arg": Block()}
+block_stack = []
 
 def preprocess(lines):
     global symbols
@@ -724,8 +678,6 @@ def run(lines, debug=False, verbose=False):
     global call_stack
     global primitives
 
-    primitives = load_functions("functions")
-
     lines = preprocess(lines)
 
     call_stack.append(Frame("Main", -2, "arg", {"arg": Block()}, []))
@@ -741,11 +693,60 @@ def run(lines, debug=False, verbose=False):
 
     return lcl[block]
 
+# CLI ########################################
+
+def print_stack():
+    if len(call_stack) == 0:
+        return
+
+    print("\033c")
+    print(blue(f"= TRACE =========================================="))
+
+    prev_frame = call_stack[0]
+    for frame in call_stack[1:]:
+        print(prev_frame)
+        # print(frame.lcl)
+        if not isinstance(frame, ForFrame):
+            for line in frame.lcl[frame.block].lines:
+                print(line)
+
+        prev_frame = frame
+    print(prev_frame)
+    print()
+
+    print(lcl[block])
+    if isinstance(call_stack[-1], ForFrame):
+        print(green("--------------------------------------------------"))
+
+    l = len(block) + 4
+    rem = 50 - l
+    s = "-"*(int(rem/2)) + f" [{block}] "
+    s = s + "-"*(50-len(s))
+    print(cyan(s))
+    print()
+    # print(str(lcl))
+
+
+    print(blue(f"= LOCALS ========================================="))
+    for var, val in lcl.items():
+        if var == block:
+            continue
+
+        val_type = str(type(val)).split("'")[1].split(".")[1]
+        s = f"- {var} ({val_type}) "
+        s = s + "-"*(50-len(s))
+        print(cyan(s))
+        if val:
+            print()
+            print(val, end="")
+            print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument("filename", type=str, help="Input filename")
-    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
+    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode: pause at each line")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode: print the prompt stack")
 
     clargs = parser.parse_args()
 
@@ -755,6 +756,9 @@ def main():
 
     debug = clargs.debug
     verbose = clargs.verbose
+
+    if debug:
+        verbose = True
 
     run(lines, debug=debug, verbose=verbose)
 
