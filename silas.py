@@ -2,6 +2,8 @@ import argparse
 import importlib
 import inspect
 from dataclasses import dataclass
+import re
+import openai
 
 # TODO: argv input (for each? index? get length?)
 # - foreach <stack name> as if each one is pushed to one arg function
@@ -11,11 +13,12 @@ from dataclasses import dataclass
 # - you can pop stacks until they are empty
 # - not just push but insertions
 # - pass block references as well as args. if you push a block it includes its tags?
+#   - perhaps do this by calling goto <fct> which doesn't touch the call stack, return_ctrl would be modified
 
 # TODO: type system
 # - everything has a prompt represtation and a program representation;
 #   no need for all the if/elses in the runtime
-# - should everything be a block
+# - should all local variables be converted to blocks? ie pop pushes to a block
 
 
 # TODO: callable as python
@@ -33,298 +36,727 @@ magenta = lambda text: f"\033[35m{text}\033[0m"
 cyan = lambda text: f"\033[36m{text}\033[0m"
 white = lambda text: f"\033[37m{text}\033[0m"
 
-# stack = ["- BASE -------------------------------------------\n"]
-stack = []
-heap = []
-primitives = {} # python functions
-symbols = {} # label -> address mappings
-slobmys = {} # address -> label mappings
-
-lcl = {}
-static = {}
-
-pc = 0
-sp = 0 # cannot pop base of stack
-
-
 def load_functions(module_name):
     module = importlib.import_module(module_name)
     functions = inspect.getmembers(module, inspect.isfunction)
     fct_dict = {name.replace('_', "-"): fct for name, fct in functions}
     return fct_dict
 
-def push(x):
-    global lcl
-    global stack
-    global sp
 
-    if isinstance(x, Frame):
-        stack.append(x)
-        return
+# TYPES ##########################################;
 
-    if x.strip() in lcl:
-        x = x.strip()
-        if debug: input(f"push: {len(lcl[x])} lines from {x}")
-        if isinstance(lcl[x], (tuple, list)):
-            stack += lcl[x]
+class Block:
+    def __init__(self, initial=None):
+        self.lines = []
+        self.index = -1
+
+        if initial:
+            self.push(initial)
+
+    def push(self, x):
+        # x is a typed prompt object
+
+        if isinstance(x, list):
+            self.lines += x
             return
-        stack.append(lcl[x])
-        return
-    if debug: input(f"push: {x}")
-    stack.append(x)
 
-def pop(x="null", n=1):
-    global stack
-    global lcl
-    global sp
+        if not self.index == -1:
+            self.lines.insert(self.index, x)
+            self.index += 1
+            return
 
-    x = x.strip()
-    n = n.strip() if isinstance(n, str) else n
+        self.lines.append(x)
 
-    if debug: input(f"pop {n} -> {x}")
+    def pop(self, n=1, pop_all=False):
+        # TODO: index MUST roll back to what came before popped segment
+        # there will be bugs when you start moving the pointer
 
-    if n == "*":
-        n = len(stack) - (sp + 1)
-    else:
-        if isinstance(n, str):
-            assert n.isdigit(), f"nargs must be a number, not {n}"
+        if pop_all:
+            if self.index == -1:
+                popped = self.lines
+                self.lines = []
+                return popped
+            popped = self.lines[:self.index]
+            del self.lines[:self.index]
+            popped = popped[0] if len(popped) == 1 else popped
+            self.index = 0
+            return popped
 
-    popped = stack[-n:]
-    del stack[-n:]
-    lcl[x] = popped
-    return
+        if self.index == -1:
+            popped = self.lines[-n:]
+            del self.lines[-n:]
+            popped = popped[0] if n == 1 else popped
+            return popped
 
-def dup(n=1):
-    global stack
-    global sp
-    if n == "*":
-        n = len(stack) - 1 - sp
+        popped = self.lines[self.index - n:self.index]
+        popped = popped[0] if len(popped) == 1 else popped
+        del self.lines[self.index - n:self.index]
 
-    if debug: input(f"dup: {n}")
+        return popped
 
-    stack += stack[-n:]
+    def flip(self):
+        self.index = len(self.lines) - self.index - 1
+        self.lines.reverse()
 
-def goto(symbol):
-    global pc
-    # pc = loc
-    symbol = symbol.strip()
-    pc = symbols[symbol] -1 # -1 because pc is incremented after each instruction
-    if debug: input(f"sending control to {symbol} ({symbols[symbol]})")
+    def select(self, index=-1):
+       self.index = index
 
-def if_goto(symbol):
-    global pc
+    def __str__(self):
+        return "".join([str(line) for line in self.lines])
 
-    symbol = symbol.strip()
+    def __getitem__(self, index):
+        return self.lines[index]
 
-    do_jump = stack.pop()
+    def __len__(self):
+        return len(self.lines)
 
-    if do_jump == "True\n":
-        if debug: input(f"sending control to {symbol} ({symbols[symbol]})")
-        pc = symbols[symbol.strip()] - 1 # -1 because pc is incremented after each instruction
-    elif do_jump == "False\n":
-        if debug: input(f"continuing to {pc+1}")
-    else:
-        assert False, f"if-goto expected [True, False], not {do_jump}"
+
+class Line:
+    def __init__(self, value:str):
+        self.value = value
+        if value.endswith("\n"):
+            self.value = value[:-1]
+
+    def __str__(self):
+        return self.value + "\n"
+
+class Bool:
+    def __init__(self, value:str):
+        self.value = True if value.strip() == "True" else False
+
+    def __str__(self):
+        return str(self.value) + "\n"
+
+    def __bool__(self):
+        return self.value
+
+class Int:
+    def __init__(self, value:str):
+        self.value = int(value)
+
+    def __str__(self):
+        return str(self.value) + "\n"
+
+class Float:
+    def __init__(self, value:str):
+        self.value = float(value)
+
+    def __str__(self):
+        return str(self.value) + "\n"
+
+
+# class Enum:
+#     def __init__(self, value:str, options:list[str]):
+#         self.value = value
+#         self.options = options
+
+#     def __str__(self):
+#         return str(self.value) + "\n"
+
+# RUNTIME ########################################;
+
+call_stack = []
+heap = []
+primitives = {} # python functions
+symbols = {} # label -> address mappings
+static = {}
+
+pc = 0
+block = "arg"
+lcl = {"arg": Block()}
+block_stack = []
 
 @dataclass
 class Frame:
     fct: str
-    sp: int
     pc: int
+    block: str
+    # blocks: dict[str, Block]
     lcl: dict
+    block_stack: list[str]
 
     def __str__(self):
-        r = f"- {self.fct} ({self.sp}) "
-        return r + (50-len(r)) * "-" + "\n"
+        r = f"- {self.fct} "
+        return cyan(r + (50-len(r)) * "-")
 
-    def __iter__(self):
-        yield self.fct
-        yield self.sp
-        yield self.pc
-        yield self.lcl
+@dataclass
+class ForFrame:
+    for_block_name: str
+    open_pc: int
+    close_pc: int
+    block_index: int
+    iter_var: str
+    iter_block: str
 
-def call(fct, nargs): # The function becomes what it wants to return
+    def __str__(self):
+        r = f"- {self.for_block_name.replace('_', ' ')} (iteration {self.block_index}) "
+        return green(r + (50-len(r)) * "-")
+
+
+def parse_arg(x: str):
+    # transform string into typed prompt object
+    x_stripped = x.strip()
+
+    if x_stripped.isdigit():
+        value = Int(x_stripped)
+    elif x_stripped.replace(".","").isdigit():
+        value = Float(x_stripped)
+    elif x_stripped in ["True", "False"]:
+        value = Bool(x_stripped)
+    # TODO: enums
+    else:
+        value = Line(x)
+
+    return value
+
+def separate_string(s):
+    result = []
+    last_end = 0
+    for match in re.finditer(r'(?<!\\)(\[.*?\])|(?<!\\)({.*?})', s):
+        # Add the "prompt" type for text between matches
+        if last_end != match.start():
+            result.append((s[last_end:match.start()].replace("\\[", "[").replace("\\]", "]").replace("\\{", "{").replace("\\}", "}"), "prompt"))
+        # Determine the type based on the first character of the match
+        if match.group().startswith("["):
+            result.append((match.group()[1:-1], "hole"))
+        else:
+            result.append((match.group()[1:-1], "variable"))
+        last_end = match.end()
+    # Add the "prompt" type for text after the last match
+    if last_end != len(s):
+        result.append((s[last_end:].replace("\\[", "[").replace("\\]", "]").replace("\\{", "{").replace("\\}", "}"), "prompt"))
+    return result
+
+
+# OPERATIONS #####################################;
+
+def get_completion(input_string, stop=[]):
+
+    # Assign stopping tokens if provided
+
+    if not stop:
+        stop = ["\n"]
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "user", "content": input_string}
+        ],
+        stop=stop
+    )
+
+    return response['choices'][0]['message']['content']
+
+def push(x):
     global lcl
-    global sp
+    global block
+
+    x_strip = x.strip()
+
+    # if not x_strip in lcl:
+    x = parse_arg(x)
+    lcl[block].push(x)
+    return
+
+    # lcl[block].push(lcl[x_strip])
+
+def fill_prompt(prompt):
+    global lcl
+
+    segments = separate_string(prompt)
+    context = [str(lcl[block])]
+    filled = []
+    for segment, segment_type in segments:
+        stop_tokens = []
+        if segment_type == "hole":
+            if "|" in segment:
+                options = segment.split("|")
+                segment = options.pop(0)
+                for option in options:
+                    if option.startswith("*"):
+                        stop_tokens.append(option[1:])
+                        continue
+                    # TODO: other constraints]
+                    input(repr(option))
+                    raise Exception(f"Invalid hole constraint: {option}")
+
+            completion = get_completion("".join(context + filled), stop=stop_tokens)
+            filled.append(completion)
+            lcl[segment] = parse_arg(completion)
+
+        elif segment_type == "variable":
+            assert segment in lcl, f"(line {pc+1}) No local variable '{segment}'"
+            if isinstance(lcl[segment], Block):
+                filled.append(str(lcl[segment]))
+            else:
+                filled.append(str(lcl[segment].value))
+        else:
+            filled.append(segment)
+
+    return "".join(filled)
+
+def pop(n_and_var):
+    global lcl
+    global block
+
+    n_and_var = n_and_var.rstrip().split(" ")
+
+    n_pop_args = len(n_and_var)
+    pop_all = False
+
+    if n_pop_args == 0:
+        lcl[block].pop()
+        return
+
+    if n_pop_args == 1:
+        arg = n_and_var[0]
+        if arg.isdigit():
+            n = int(arg)
+            lcl[block].pop(n)
+            return
+
+        if arg == "*":
+            lcl[block].pop(pop_all=True)
+            return
+
+        # otherwise the argument is a variable name, pop 1 from it
+        n_and_var = [1] + n_and_var
+        n_pop_args = 2
+
+    if n_pop_args == 3:
+        # for syntax like "pop 3 to block"
+        assert n_and_var[1] == "to", f"(line {pc+1}) pop: for 3 arguments middle must be 'to' but was '{n_and_var[1]}'"
+        n_and_var.pop(1)
+        n_pop_args = 2
+
+    if n_pop_args == 2:
+        n, var = n_and_var
+
+        if n == "to":
+            # syntax like "pop to var"
+            n = 1
+
+        if n == "*":
+            pop_all = True
+            n = 1 # ignored; n is overridden when pop_all
+
+        if not isinstance(n, int):
+            assert n.isdigit(), f"(line {pc+1}) pop: {n} is not a number or 'to'"
+            n = int(n)
+
+        if var in lcl:
+            # append to existing block
+            if isinstance(lcl[var], Block):
+                x = lcl[block].pop(n, pop_all=pop_all)
+                lcl[var].push(x)
+                return
+
+            assert n == 1, f"(line {pc+1}) pop: cannot pop more than 1 to non-block variable {var}"
+
+            # otherwise overwrite existing variable
+            lcl[var] = lcl[block].pop(n, pop_all=pop_all)
+            return
+
+        # create new variable
+        if n > 1:
+            x = lcl[block].pop(n, pop_all=pop_all)
+            lcl[var] = Block(x)
+            return
+
+        val = lcl[block].pop(pop_all=pop_all)
+
+        if isinstance(val, list):
+            lcl[var] = Block(val)
+            return
+
+        lcl[var] = val
+
+        return
+
+    raise Exception(f"(line {pc+1}) pop: too many arguments: {n_pop_args}")
+
+def goto(symbol):
     global pc
-    global stack
+    global symbols
+    symbol = symbol.strip()
+    pc = symbols[symbol] -1 # -1 because pc is incremented after each instruction
 
-    nargs = nargs.strip()
+def if_goto(symbol):
+    global pc
+    global symbols
 
-    if nargs == "*":
-        nargs = len(stack) - (sp + 1)  # +1 to exclude Frame
+    symbol = symbol.strip()
+
+    do_jump = lcl[block].pop()
+
+    assert isinstance(do_jump, Bool), f"(line {pc+1}) if_goto: expected Bool but got {type(do_jump)}"
+
+    if do_jump:
+        pc = symbols[symbol] - 1
+
+
+def open_block(name):
+    global lcl
+    global block
+    global block_stack
+
+    block_stack.append(block)
+    block = name
+    if not name in lcl:
+        lcl[block] = Block()
+
+    assert isinstance(lcl[block], Block), f"(line {pc+1}) block: cannot open {type(lcl[block])} as block"
+
+def close_block(name):
+    global lcl
+    global block
+    global block_stack
+
+    assert block == name, f"(line {pc+1}) close block: expected </{name}> but got </{block}>"
+
+    block = block_stack.pop()
+
+
+def call(fct_and_nargs: str, nargs: int=None):
+
+    pop_all = False
+
+    if nargs:
+        fct, nargs = fct_and_nargs.strip(), nargs
     else:
-        assert nargs.isdigit(), f"nargs must be a number, not {nargs}"
+        fct_and_nargs = fct_and_nargs.split(" ")
+        if len(fct_and_nargs) == 1:
+            fct, nargs = fct_and_nargs[0].strip(), 0 # if nargs isn't specified assume no args
+        elif len(fct_and_nargs) == 2:
+            fct, nargs = fct_and_nargs
+            fct = fct.strip()
+            nargs = nargs.strip()
+            if not nargs == "*":
+                assert nargs.isdigit(), f"(line {pc+1}) call: expected number of arguments, got {nargs} in '{fct} {nargs}'"
+                nargs = int(nargs)
+            else:
+                assert nargs == "*",  f"(line {pc+1}) call: only '*' is supported for variable number of arguments"
+                nargs = 1
+                pop_all = True
+        else:
+            raise Exception(f"(line {pc+1}) call: too many arguments to in call '{fct_and_nargs}'")
 
-    nargs = int(nargs)
 
-    if nargs > 0:
-        arg = stack[-nargs:]
-        del stack[-nargs:]
-    else:
-        arg = []
+    # TODO: ability to define functions with fixed nargs
+    global call_stack
+    global block
+    global lcl
+    global block_stack
 
-    push(Frame(fct, sp, pc, lcl.copy()))
+    if isinstance(nargs, str):
+        nargs = nargs.strip()
+        if not nargs == "*":
+            assert nargs.isdigit(), f"(line {pc+1}) call: expected number of arguments, got {nargs}"
+            nargs = int(nargs.strip())
+        else:
+            assert nargs == "*",  f"(line {pc+1}) call: only '*' is supported for variable number of arguments"
+            nargs = 1
+            pop_all = True
 
-    sp = len(stack) - 1
-
-    # arg = new_arg
+    args = lcl[block].pop(nargs, pop_all=pop_all)
 
     if fct in primitives:
-        result = primitives[fct](arg)
-        if debug: print(f"call: {fct} {nargs} -> {result}")
-        if isinstance(result, (tuple, list)):
-            stack += result
-        else:
-            stack.append(result)
+        result = primitives[fct](args)
+        lcl[block].push(result)
+        return
 
+    frame = Frame(fct, pc, block, lcl, block_stack)
+    call_stack.append(frame)
+    block = "arg"
+    lcl = {"arg": Block(args)}
+    block_stack = []
+    goto(fct)
+
+def break_loop():
+    assert isinstance(call_stack[-1], ForFrame), f"(line {pc+1}) break: can only break out of loops"
+    frame = call_stack[-1]
+    close_for_loop()
+    goto(frame.close_pc)
+
+def return_ctrl():
+    global call_stack
+    global pc
+    global block
+    global lcl
+    global block_stack
+
+    frame = call_stack.pop()
+    pc = frame.pc
+    result = lcl[block] # fetch final state of called function
+    lcl = frame.lcl
+    block = frame.block
+    if len(result) == 1:
+        result = result[0]
+    lcl[block].push(result)
+    block_stack = frame.block_stack
+
+
+# TODO: open/clear/close block in for loop
+def open_for_loop(var_and_block):
+    global call_stack
+    global lcl
+    global pc
+
+    # make the language server happy
+    for_block_name = None
+    iter_var = None
+    iter_block = None
+
+    if isinstance(call_stack[-1], ForFrame) and call_stack[-1].close_pc is not None:
+        call_stack[-1].block_index += 1
+        lcl[call_stack[-1].for_block_name].pop(pop_all=True)
+    else:
+        for_block_name = "for_" + var_and_block.replace(" ", "_").rstrip()
+        open_block(for_block_name)
+        # lcl[block].pop(pop_all=True)
+        var_and_block = var_and_block.split(" ")
+        assert len(var_and_block) == 3, f"(line {pc+1}) for: expected the form 'for x in y', got {' '.join(var_and_block)}"
+
+        iter_var, _, iter_block = var_and_block
+        iter_block = iter_block.strip()
+
+        assert isinstance(lcl[iter_block], Block), f"(line {pc+1}) iterate: expected block, got {type(lcl[iter_block])}"
+        assert len(lcl[iter_block]) > 0, f"(line {pc+1}) for: block {iter_block} is empty"
+        call_stack.append(ForFrame(for_block_name, pc - 1, None, 0, iter_var, iter_block))
+
+    frame = call_stack[-1]
+    for_block_name = frame.for_block_name
+    block_index = frame.block_index
+    iter_var = frame.iter_var
+    iter_block = frame.iter_block
+
+    if block_index == len(lcl[iter_block]):
+        pc = frame.close_pc
+        call_stack.pop()
+        del lcl[iter_var]
+        close_block(for_block_name)
+        return
+
+    lcl[iter_var] = lcl[iter_block][block_index]
+
+def close_for_loop():
+    global pc
+    global call_stack
+    assert isinstance(call_stack[-1], ForFrame), f"(line {pc+1}) endfor: missing for statement"
+
+    if not call_stack[-1].close_pc:
+        call_stack[-1].close_pc = pc
+
+    # close_block(call_stack[-1].for_block_name)
+    pc = call_stack[-1].open_pc
+
+# INTERFACE ########################################;
+
+def print_stack():
+    if len(call_stack) == 0:
+        return
+
+    print("\033c")
+    print(blue(f"= TRACE =========================================="))
+
+    prev_frame = call_stack[0]
+    for frame in call_stack[1:]:
+        print(prev_frame)
+        # print(frame.lcl)
+        if not isinstance(frame, ForFrame):
+            for line in frame.lcl[frame.block].lines:
+                print(line)
+
+        prev_frame = frame
+    print(prev_frame)
+    print()
+
+    print(lcl[block])
+    if isinstance(call_stack[-1], ForFrame):
+        print(green("--------------------------------------------------"))
+
+    l = len(block) + 4
+    rem = 50 - l
+    s = "-"*(int(rem/2)) + f" [{block}] "
+    s = s + "-"*(50-len(s))
+    print(cyan(s))
+    print()
+    # print(str(lcl))
+
+
+    print(blue(f"= LOCALS ========================================="))
+    for var, val in lcl.items():
+        if var == block:
+            continue
+
+        val_type = str(type(val)).split("'")[1].split(".")[1]
+        s = f"- {var} ({val_type}) "
+        s = s + "-"*(50-len(s))
+        print(cyan(s))
+        if val:
+            print()
+            print(val, end="")
+            print()
+
+def preprocess(lines):
+    global symbols
+    lines = [line.lstrip() for line in lines]
+
+    # process labels and function definitions
+    i = 0
+    remaining_lines = len(lines)
+    # while remaining_lines > 0:
+    while i < len(lines):
+        remaining_lines -= 1
+        if lines[i].startswith("## "):
+            label = lines[i][3:].strip()
+            symbols[label] = i
+            # lines.pop(i)
+            i += 1
+            continue
+        if lines[i].startswith("# "):
+            name = lines[i][2:].strip()
+            name = name.strip()
+            # print(name)
+            symbols[name] = i
+            # lines.pop(i)
+            i += 1
+            continue
+
+        # print(str(i) + " " + str(len(lines)))
+        i += 1
+
+    # input(f"RRETURNED ON {i}")
+    return lines
+
+def execute_line(line):
+    global pc
+
+    if line == "":
+        return
+
+    if line.startswith("> "):
+        # TODO: instead use {} to insert locals anywhere in line
+        line = line[2:]
+        line = fill_prompt(line)
+        push(line)
+        return
+
+    if line.startswith("pop"):
+        line = line[3:].lstrip()
+        pop(line)
+        return
+
+    if line.startswith("goto "):
+        line = line[5:]
+        goto(line)
+        return
+
+    if line.startswith("if-goto "):
+        line = line[8:]
+        if_goto(line)
+        return
+
+    if line.startswith("call "):
+        line = line[5:]
+        call(line)
+        return
+
+    if line.startswith("return"):
         return_ctrl()
         return
 
-    if debug: print(f"call: {fct} {nargs}")
+    if any(line.startswith(f"{x} ") for x in primitives):
+        call(line)
+        return
 
-    stack += arg
+    if line.startswith("for "):
+        line = line[4:]
+        open_for_loop(line)
+        return
 
-    lcl = {}
-    goto(fct)
+    if line.startswith("endfor"):
+        close_for_loop()
+        return
+
+    if line.startswith("</"):
+        # extract until >
+        line = line[2:]
+        line = line.split(">")
+        assert len(line) == 2, f"(line {pc+1}) Closing block statement missing '>': {line} "
+        close_block(line[0])
+        return
+
+    if line.startswith("<"):
+        # extract until >
+        line = line[1:]
+        line = line.split(">")
+        assert len(line) == 2, f"(line {pc+1}) Opening block statement missing '>': {line} "
+        open_block(line[0])
+        return
+
+    if line.startswith("debug"):
+        print_stack()
+        return
+
+    if line.startswith("break"):
+        break_loop()
+        return
+
+    if line.startswith("exit"):
+        pc = -1
+        return
+
+    if line.startswith("~"):
+        return
+
+    if line.startswith("#"):
+        return
+
+    if line.startswith(" "):
+        return
+
+    raise Exception(f"(line {pc+1}) Unknown line: {line}")
 
 
-def return_ctrl():
-    global lcl
-    global sp
+def run(lines, debug=False, verbose=False):
     global pc
-    global stack
+    global call_stack
+    global primitives
 
-    _, sp, pc, lcl = stack.pop(sp)
+    primitives = load_functions("functions")
 
-    if debug: input(f"returning control to caller ({pc + 1})")
+    lines = preprocess(lines)
 
-def print_stack():
-    global stack
-    global lcl
-    print("\033c")
-    for x in stack[:-1]:
-        print(x, end="")
-    print(stack[-1], end="")
-    if debug:
-        print("\n\n")
-        print("- LOCALS -----------------------------------------")
-        for x, lines in lcl.items():
-            print(f"{x}:")
-            for line in lines:
-                print(f"    {line}", end="")
-            print()
-        print("--------------------------------------------------\n")
+    call_stack.append(Frame("Main", -2, "arg", {"arg": Block()}, []))
 
+    while pc >= 0:
+        line = lines[pc]
+        execute_line(line)
+        pc += 1
+        if verbose:
+            print_stack()
+        if debug:
+            input("\n(CR to continue)")
 
+    return lcl[block]
 
 def main():
     parser = argparse.ArgumentParser(description="Process some files.")
     parser.add_argument("filename", type=str, help="Input filename")
-    parser.add_argument("-o", "--output", type=str, help="Output filename", default="")
-    parser.add_argument("--debug", action="store_true", help="Debug mode")
+    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
 
     clargs = parser.parse_args()
-
-    global debug
-    debug = clargs.debug
-
 
     file = clargs.filename
     with open(file, "r") as f:
         lines = f.readlines()
 
-    lines = [line.lstrip() for line in lines if line.strip() and line.strip() != ">!"]
+    debug = clargs.debug
+    verbose = clargs.verbose
 
-    global pc
-    global primitives
-    global stack
-
-    primitives = load_functions("functions")
-
-    # process labels and function definitions
-    i = 0
-    remaining_lines = len(lines)
-    while remaining_lines > 0:
-        lines[i] = lines[i]
-        remaining_lines -= 1
-        if lines[i].startswith("## "):
-            label = lines[i][3:].strip()
-            symbols[label] = i
-            lines.pop(i)
-            continue
-        if lines[i].startswith("# "):
-            name = lines[i][2:].strip()
-            name = name.strip()
-            symbols[name] = i
-            lines.pop(i)
-            continue
-
-        i += 1
-
-    if debug:
-        global slobmys
-        slobmys = {v: k for k, v in symbols.items()}
-
-    if clargs.output:
-        with open(clargs.output, "w") as f:
-            f.write("".join(lines))
-            f.write("\n")
-            f.write(str(symbols))
-    else:
-        while pc >= 0:
-            line = lines[pc]
-            cmd_and_arg = line.split(" ", 1)
-            if len(cmd_and_arg) == 1:
-                cmd, arg = cmd_and_arg[0].strip(), "" # strip because it will include \n
-            else:
-                cmd, arg = cmd_and_arg
-
-            match cmd:
-                case ">":
-                    if arg.startswith("!"):
-                        cmd_and_arg = arg[1:].split(" ", 1)
-                        if len(cmd_and_arg) == 1:
-                            cmd, nargs = cmd_and_arg[0].strip(), "0"
-                        else:
-                            cmd, nargs = cmd_and_arg
-                        call(cmd, nargs)
-                    else:
-                        push(arg)
-                case "pop":
-                    if " " in arg:
-                        arg, n = arg.split(" ", 1)
-                        pop(arg, n)
-                    else:
-                        pop(arg)
-                case "dup":
-                    dup(arg)
-                case "goto":
-                    goto(arg)
-                case "if-goto":
-                    if_goto(arg)
-                case "call":
-                    fct, nargs = arg.split(" ", 1)
-                    call(fct, nargs)
-                case "return":
-                    return_ctrl()
-                case "exit":
-                    pc = -1
-                    break
-                case _:
-                    nargs = arg
-                    call(cmd, nargs)
-
-            pc += 1
-
-            print_stack()
-        input("\n[ finished ]")
-
-
-
-
-
-
+    run(lines, debug=debug, verbose=verbose)
 
 if __name__ == "__main__":
     main()
