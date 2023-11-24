@@ -21,8 +21,7 @@ python silas.py -d examples/rate_reviews.md
 ```
 (-d stands for debug and displays variable and block states during execution)
 
-***
-
+```
 > Some of the jars were broken, but there were still enough
 > It looks nice, although the stickers are not laminated.
 > The product dimensions are wrong in the description.
@@ -45,4 +44,4 @@ for review in arg
     </reviews>
 endfor
 return
-
+```
